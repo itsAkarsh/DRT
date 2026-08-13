@@ -25,7 +25,7 @@ npm run dev
 
 Open `http://127.0.0.1:5173` in your browser.
 
-## Cloudflare Pages deployment
+## Cloudflare deployment
 
 Build the site with:
 
@@ -33,7 +33,7 @@ Build the site with:
 npm run build
 ```
 
-Configure Cloudflare Pages as follows:
+Configure Cloudflare Pages or Workers Builds as follows:
 
 | Setting | Value |
 | --- | --- |
@@ -41,7 +41,7 @@ Configure Cloudflare Pages as follows:
 | Build output directory | `dist/renderer` |
 | Node.js version | `20` or later |
 
-Connect the GitHub repository in Cloudflare Pages. Every push to the production branch will trigger a deployment.
+Connect the GitHub repository in Cloudflare. Every push to the production branch will trigger a deployment. The included `wrangler.jsonc` also supports static-asset deployment through Cloudflare Workers Builds.
 
 ## Browser limitations
 
