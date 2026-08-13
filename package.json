@@ -5,9 +5,9 @@
   "author": "DRT",
   "license": "MIT",
   "scripts": {
-    "dev": "vite --config vite.config.js",
-    "build": "npm run typecheck && vite build",
-    "preview": "vite preview --config vite.config.js",
+    "dev": "vite --config vite.config.mjs",
+    "build": "npm run typecheck && vite build --config vite.config.mjs",
+    "preview": "vite preview --config vite.config.mjs",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
