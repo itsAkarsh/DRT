@@ -9,7 +9,7 @@ DRT runs entirely in the browser. CSV/XLSX files are selected from the user's de
 - Source and destination CSV/XLSX upload
 - Multiple key mapping and manual column mapping
 - Mapping and KB workbook import
-- General Equal and KB Doc comparison
+- Configurable fuzzy value comparison (50–100%) and KB Doc comparison
 - Match, difference, missing, destination-only, and duplicate-key reporting
 - Searchable results and Excel report download
 - Locally saved mapping configurations

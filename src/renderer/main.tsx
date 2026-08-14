@@ -1,335 +1,199 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  Bell, CalendarClock, Check, ChevronDown, FileSpreadsheet,
-  GitCompareArrows, KeyRound, Plus, Settings2, Trash2, Upload
-} from "lucide-react";
-import "./styles.css";
-import UploadCard from "./components/UploadCard";
-import Results from "./components/Results";
-import { loadDataset, loadMappingWorkbook } from "./services/dataService";
-import { reconcile } from "./services/reconciliationService";
-import { createReportWorkbook } from "./services/reportService";
-import {
-  deleteConfiguration, getConfigurations, saveConfiguration,
-  SavedConfiguration
-} from "./services/storeService";
-import {
-  ColumnMapping, ComparisonMode, Dataset, KeyMapping, ReconciliationResult
-} from "../shared/types";
+import Papa from "papaparse";
+import { ArrowRight, Check, CheckCircle2, ChevronDown, FileDown, FileSpreadsheet, FileUp, GitCompareArrows, LockKeyhole, Plus, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Upload } from "lucide-react";
 
-type Tab = "reconcile" | "results" | "schedules" | "alerts" | "settings";
+type Method = "general" | "fuzzy" | "kb";
+type Row = Record<string, unknown>;
+type Dataset = { name: string; columns: string[]; data: Row[] };
+type Mapping = { id: string; source: string; destination: string; isKey: boolean; method: Method; threshold: number };
+type ColumnPair = { source: string; destination: string };
+type SavedReconciliation = { id: string; name: string; mappings: Mapping[]; rules: KBRule[]; organization: string; savedAt: string };
+type KBRule = { organization: string; sourceColumn: string; sourceValue: string; destinationColumn: string; destinationValue: string };
+type FieldResult = { source: string; destination: string; sourceValue: string; expectedValue: string; destinationValue: string; method: Method; score?: number; status: "MATCH" | "DIFFERENCE" | "MISSING" | "UNMAPPED"; reason: string };
+type ResultRow = { key: string; status: "MATCH" | "DIFFERENCE" | "MISSING" | "DESTINATION_ONLY"; fields: FieldResult[] };
+
+const clean = (value: unknown) => String(value ?? "").trim().replace(/\s+/g, " ");
+const normalized = (value: unknown) => clean(value).toLocaleLowerCase();
+const id = () => crypto.randomUUID();
+const SAVED_RECONCILIATIONS_KEY = "drt.saved-reconciliations";
+const getSavedReconciliations = (): SavedReconciliation[] => { try { return JSON.parse(localStorage.getItem(SAVED_RECONCILIATIONS_KEY) || "[]"); } catch { return []; } };
+const saveSavedReconciliations = (items: SavedReconciliation[]) => localStorage.setItem(SAVED_RECONCILIATIONS_KEY, JSON.stringify(items));
+
+function editRatio(a: string, b: string) {
+  if (a === b) return 100;
+  if (!a || !b) return 0;
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let row = 1; row <= a.length; row++) {
+    let diagonal = previous[0]; previous[0] = row;
+    for (let column = 1; column <= b.length; column++) {
+      const saved = previous[column];
+      previous[column] = Math.min(previous[column] + 1, previous[column - 1] + 1, diagonal + (a[row - 1] === b[column - 1] ? 0 : 1));
+      diagonal = saved;
+    }
+  }
+  return Math.round((1 - previous[b.length] / Math.max(a.length, b.length)) * 100);
+}
+
+/** Equivalent in intent to fuzz.token_set_ratio: word order and repeated words do not affect a match. */
+function tokenSetRatio(left: string, right: string) {
+  const leftSet = new Set(normalized(left).split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+  const rightSet = new Set(normalized(right).split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+  const shared = [...leftSet].filter(token => rightSet.has(token)).sort();
+  const leftOnly = [...leftSet].filter(token => !rightSet.has(token)).sort();
+  const rightOnly = [...rightSet].filter(token => !leftSet.has(token)).sort();
+  const common = shared.join(" ");
+  const a = [...shared, ...leftOnly].join(" ");
+  const b = [...shared, ...rightOnly].join(" ");
+  if (!common) return editRatio(a, b);
+  if (!leftOnly.length || !rightOnly.length) return 100;
+  return Math.max(editRatio(common, a), editRatio(common, b), editRatio(a, b));
+}
+
+async function readDataset(file: File): Promise<Dataset> {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  let data: Row[];
+  if (extension === "csv") {
+    const parsed = Papa.parse<Row>(await file.text(), { header: true, skipEmptyLines: true });
+    if (parsed.errors.length) throw new Error(parsed.errors[0].message);
+    data = parsed.data;
+  } else if (extension === "xlsx" || extension === "xls") {
+    const XLSX = await import("xlsx");
+    const book = XLSX.read(await file.arrayBuffer(), { type: "array" });
+    data = XLSX.utils.sheet_to_json<Row>(book.Sheets[book.SheetNames[0]], { defval: "" });
+  } else throw new Error("Choose a CSV, XLSX, or XLS file.");
+  const columns = [...new Set(data.flatMap(row => Object.keys(row)))];
+  if (!columns.length) throw new Error("The file does not contain a header row.");
+  return { name: file.name, columns, data };
+}
+
+async function readKB(file: File): Promise<KBRule[]> {
+  const XLSX = await import("xlsx");
+  const book = XLSX.read(await file.arrayBuffer(), { type: "array" });
+  const rows = XLSX.utils.sheet_to_json<Row>(book.Sheets[book.SheetNames[0]], { defval: "" });
+  const headers = Object.keys(rows[0] || {});
+  const header = (...names: string[]) => headers.find(name => names.includes(normalized(name)));
+  const sourceColumn = header("source column", "source_column");
+  const sourceValue = header("source value", "source_value");
+  const destinationColumn = header("destination column", "destination_column");
+  const destinationValue = header("destination value", "destination_value", "mapped value", "mapped_value");
+  const organization = header("organization", "org");
+  if (!sourceColumn || !sourceValue || !destinationColumn || !destinationValue) throw new Error("KB sheet needs Source Column, Source Value, Destination Column, and Destination Value headers.");
+  return rows.map(row => ({ organization: organization ? clean(row[organization]) : "", sourceColumn: clean(row[sourceColumn]), sourceValue: clean(row[sourceValue]), destinationColumn: clean(row[destinationColumn]), destinationValue: clean(row[destinationValue]) })).filter(rule => rule.sourceColumn && rule.destinationColumn);
+}
+
+async function readColumnMappings(file: File): Promise<ColumnPair[]> {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  let rows: Row[];
+  if (extension === "csv") {
+    const parsed = Papa.parse<Row>(await file.text(), { header: true, skipEmptyLines: true });
+    if (parsed.errors.length) throw new Error(parsed.errors[0].message);
+    rows = parsed.data;
+  } else if (extension === "xlsx" || extension === "xls") {
+    const XLSX = await import("xlsx");
+    const book = XLSX.read(await file.arrayBuffer(), { type: "array" });
+    rows = XLSX.utils.sheet_to_json<Row>(book.Sheets[book.SheetNames[0]], { defval: "" });
+  } else throw new Error("Choose a CSV, XLSX, or XLS mapping document.");
+  const headers = Object.keys(rows[0] || {});
+  const header = (...names: string[]) => headers.find(name => names.includes(normalized(name)));
+  const source = header("source column", "source_column", "source");
+  const destination = header("destination column", "destination_column", "destination");
+  if (!source || !destination) throw new Error("Mapping document needs Source Column and Destination Column headers.");
+  return rows.map(row => ({ source: clean(row[source]), destination: clean(row[destination]) })).filter(pair => pair.source && pair.destination);
+}
+
+function defaultMappings(source: Dataset, destination: Dataset) {
+  return source.columns.map((column, index) => ({ id: id(), source: column, destination: destination.columns.includes(column) ? column : destination.columns[0] || "", isKey: index === 0, method: "general" as Method, threshold: 85 }));
+}
+
+function reconcile(source: Dataset, destination: Dataset, mappings: Mapping[], rules: KBRule[], organization: string): ResultRow[] {
+  const keys = mappings.filter(mapping => mapping.isKey && mapping.source && mapping.destination);
+  if (!keys.length) throw new Error("Select at least one key column.");
+  const compare = mappings.filter(mapping => mapping.source && mapping.destination);
+  if (!compare.length) throw new Error("Add at least one valid column mapping.");
+  const makeSourceKey = (row: Row) => keys.map(key => normalized(row[key.source])).join("¦");
+  const makeDestinationKey = (row: Row) => keys.map(key => normalized(row[key.destination])).join("¦");
+  const destinationByKey = new Map<string, Row[]>();
+  destination.data.forEach(row => { const key = makeDestinationKey(row); destinationByKey.set(key, [...(destinationByKey.get(key) || []), row]); });
+  const used = new Set<string>();
+  const rows: ResultRow[] = source.data.map(sourceRow => {
+    const key = makeSourceKey(sourceRow); const candidates = destinationByKey.get(key) || []; const destinationRow = candidates[0];
+    if (!destinationRow) return { key, status: "MISSING", fields: compare.map(mapping => ({ source: mapping.source, destination: mapping.destination, sourceValue: clean(sourceRow[mapping.source]), expectedValue: "", destinationValue: "", method: mapping.method, status: "MISSING", reason: "No destination row has this key." })) };
+    used.add(key);
+    let hasDifference = false;
+    const fields = compare.map(mapping => {
+      const sourceValue = clean(sourceRow[mapping.source]); const destinationValue = clean(destinationRow[mapping.destination]);
+      let expectedValue = sourceValue; let score: number | undefined; let matched = false; let reason = "";
+      if (mapping.method === "general") { matched = normalized(sourceValue) === normalized(destinationValue); reason = matched ? "Normalized values are equal." : "Normalized values differ."; }
+      if (mapping.method === "fuzzy") { score = tokenSetRatio(sourceValue, destinationValue); matched = score >= mapping.threshold; reason = matched ? `Token-set ratio ${score}% meets ${mapping.threshold}%.` : `Token-set ratio ${score}% is below ${mapping.threshold}%.`; }
+      if (mapping.method === "kb") {
+        const rule = rules.find(item => normalized(item.sourceColumn) === normalized(mapping.source) && normalized(item.destinationColumn) === normalized(mapping.destination) && normalized(item.sourceValue) === normalized(sourceValue) && (!organization || !item.organization || normalized(item.organization) === normalized(organization)));
+        if (!rule) { hasDifference = true; return { source: mapping.source, destination: mapping.destination, sourceValue, expectedValue: "", destinationValue, method: mapping.method, status: "UNMAPPED" as const, reason: "No applicable KB value mapping was found." }; }
+        expectedValue = rule.destinationValue; matched = normalized(expectedValue) === normalized(destinationValue); reason = matched ? "Matched through the KB value mapping." : "Destination value differs from the KB mapping.";
+      }
+      if (!matched) hasDifference = true;
+      return { source: mapping.source, destination: mapping.destination, sourceValue, expectedValue, destinationValue, method: mapping.method, score, status: matched ? "MATCH" as const : "DIFFERENCE" as const, reason };
+    });
+    return { key, status: hasDifference ? "DIFFERENCE" : "MATCH", fields };
+  });
+  destinationByKey.forEach((items, key) => { if (!used.has(key)) rows.push({ key, status: "DESTINATION_ONLY", fields: compare.map(mapping => ({ source: mapping.source, destination: mapping.destination, sourceValue: "", expectedValue: "", destinationValue: clean(items[0][mapping.destination]), method: mapping.method, status: "MISSING", reason: "No source row has this key." })) }); });
+  return rows;
+}
 
 function App() {
-  const [tab, setTab] = useState<Tab>("reconcile");
-  const [source, setSource] = useState<Dataset|null>(null);
-  const [destination, setDestination] = useState<Dataset|null>(null);
-  const [mappingFile, setMappingFile] = useState<string>("");
-  const [kbFile, setKbFile] = useState<string>("");
-  const [keys, setKeys] = useState<KeyMapping[]>([{source:"",destination:""}]);
-  const [verifyColumns, setVerifyColumns] = useState<string[]>([]);
-  const [mappings, setMappings] = useState<ColumnMapping[]>([]);
-  const [mode, setMode] = useState<ComparisonMode>("general");
-  const [kbRules, setKbRules] = useState<any[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
-  const [result, setResult] = useState<ReconciliationResult|null>(null);
-  const [configs, setConfigs] = useState<SavedConfiguration[]>(getConfigurations());
-
-  const destinationColumns = destination?.columns || [];
-  const sourceColumns = source?.columns || [];
-
-  async function chooseDataset(type:"source"|"destination") {
-    const file = await pickFile(".csv,.xlsx,.xls");
-    if (!file) return;
-    try {
-      setMessage("");
-      const dataset = await loadDataset(file);
-      if (type === "source") {
-        setSource(dataset);
-        setVerifyColumns(dataset.columns);
-      } else {
-        setDestination(dataset);
-      }
-    } catch (e) {
-      setMessage(String(e));
-    }
-  }
-
-  async function chooseMapping() {
-    const file = await pickFile(".xlsx,.xls");
-    if (!file) return;
-    try {
-      setMappingFile(file.name);
-      const loaded = await loadMappingWorkbook(file);
-      if (loaded.mappings.length) {
-        setMappings(prev => {
-          const merged = [...prev];
-          for (const m of loaded.mappings) {
-            const i = merged.findIndex(x => x.source === m.source);
-            if (i >= 0) merged[i] = m; else merged.push(m);
-          }
-          return merged;
-        });
-      }
-      setMessage(`Loaded ${loaded.mappings.length} column mappings.`);
-    } catch(e) { setMessage(String(e)); }
-  }
-
-  async function chooseKB() {
-    const file = await pickFile(".xlsx,.xls");
-    if (!file) return;
-    try {
-      setKbFile(file.name);
-      const loaded = await loadMappingWorkbook(file);
-      setKbRules(loaded.rules);
-      if (loaded.mappings.length) {
-        setMappings(prev => {
-          const merged = [...prev];
-          for (const m of loaded.mappings) {
-            const i = merged.findIndex(x => x.source === m.source);
-            if (i >= 0) merged[i] = m; else merged.push(m);
-          }
-          return merged;
-        });
-      }
-      setMessage(`Loaded ${loaded.rules.length} KB value rules.`);
-    } catch(e) { setMessage(String(e)); }
-  }
-
-  function autoCreateMappings() {
-    const result: ColumnMapping[] = verifyColumns.map(s => ({
-      source: s,
-      destination: destinationColumns.includes(s) ? s : ""
-    }));
-    setMappings(result);
-  }
-
-  async function run() {
-    setMessage("");
-    if (!source || !destination) return setMessage("Upload Source and Destination first.");
-    if (!keys.length || keys.some(k => !k.source || !k.destination))
-      return setMessage("Complete all key mappings.");
-    const selected = mappings.filter(m => verifyColumns.includes(m.source) && m.destination);
-    if (!selected.length) return setMessage("Map at least one source column.");
-    if (mode === "kb" && !kbRules.length)
-      return setMessage("KB Doc mode requires a KB workbook with value mappings.");
-
-    setBusy(true);
-    try {
-      const r = reconcile(source, destination, keys, selected, mode, kbRules);
-      setResult(r);
-      setTab("results");
-    } catch(e) {
-      setMessage(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function exportResult() {
-    if (!result) return;
-    const bytes = createReportWorkbook(result);
-    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `DRT_Reconciliation_${new Date().toISOString().slice(0,10)}.xlsx`;
-    link.click();
-    URL.revokeObjectURL(url);
-  }
-
-  function saveCurrent() {
-    if (!source || !destination) {
-      setMessage("Upload Source and Destination before saving.");
-      return;
-    }
-    const config: SavedConfiguration = {
-      id: crypto.randomUUID(),
-      name: `${source.name} → ${destination.name}`,
-      sourcePath: source.path,
-      destinationPath: destination.path,
-      mappingPath: mappingFile || undefined,
-      kbPath: kbFile || undefined,
-      mode,
-      keys,
-      mappings,
-      verifyColumns
-    };
-    saveConfiguration(config);
-    setConfigs(getConfigurations());
-    setMessage("Reconciliation configuration saved locally.");
-  }
-
-  function loadConfig(c: SavedConfiguration) {
-    setKeys(c.keys);
-    setMappings(c.mappings);
-    setVerifyColumns(c.verifyColumns);
-    setMode(c.mode);
-    setMessage(`Configuration "${c.name}" loaded. Re-select the source and destination files before running.`);
-  }
-
-  return (
-    <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="logo">DR</div>
-          <div><b>DRT</b><span>Data Reconciliation</span></div>
-        </div>
-
-        <nav>
-          <Nav active={tab==="reconcile"} icon={<GitCompareArrows/>} text="Reconcile" onClick={()=>setTab("reconcile")}/>
-          <Nav active={tab==="results"} icon={<FileSpreadsheet/>} text="Results" onClick={()=>setTab("results")}/>
-          <Nav active={tab==="schedules"} icon={<CalendarClock/>} text="Schedules" onClick={()=>setTab("schedules")}/>
-          <Nav active={tab==="alerts"} icon={<Bell/>} text="Alerts" onClick={()=>setTab("alerts")}/>
-          <Nav active={tab==="settings"} icon={<Settings2/>} text="Settings" onClick={()=>setTab("settings")}/>
-        </nav>
-
-        <div className="side-status"><span className="dot"/> Local processing engine</div>
-      </aside>
-
-      <main>
-        <header>
-          <div>
-            <div className="eyebrow">DESKTOP RECONCILIATION WORKSPACE</div>
-            <h1>Compare. Validate. Explain.</h1>
-            <p>Local-first CSV/XLSX reconciliation with manual mappings and organization-specific KB rules.</p>
-          </div>
-          <div className="engine"><span className="dot"/> No backend • Local engine</div>
-        </header>
-
-        {message && <div className="message">{message}</div>}
-
-        {tab === "reconcile" && (
-          <section className="workspace">
-            <Step n="01" title="Upload datasets" sub="CSV / XLSX">
-              <div className="upload-grid">
-                <UploadCard title="Source dataset" dataset={source} onChoose={()=>chooseDataset("source")}/>
-                <UploadCard title="Destination dataset" dataset={destination} onChoose={()=>chooseDataset("destination")}/>
-              </div>
-            </Step>
-
-            <Step n="02" title="Select match keys" sub="Keys identify the corresponding record">
-              <div className="card">
-                {keys.map((k,i)=>
-                  <div className="key-row" key={i}>
-                    <Select value={k.source} placeholder="Source key" options={sourceColumns}
-                      onChange={v=>setKeys(x=>x.map((a,n)=>n===i?{...a,source:v}:a))}/>
-                    <span className="arrow">→</span>
-                    <Select value={k.destination} placeholder="Destination key" options={destinationColumns}
-                      onChange={v=>setKeys(x=>x.map((a,n)=>n===i?{...a,destination:v}:a))}/>
-                    {keys.length>1 && <button className="icon-btn" onClick={()=>setKeys(x=>x.filter((_,n)=>n!==i))}><Trash2 size={16}/></button>}
-                  </div>
-                )}
-                <button className="ghost" onClick={()=>setKeys([...keys,{source:"",destination:""}])}><Plus size={15}/> Add another key</button>
-              </div>
-            </Step>
-
-            <Step n="03" title="Select source columns to verify" sub="Each selected field is reconciled independently">
-              <div className="card">
-                <div className="checks">
-                  {sourceColumns.map(c=>
-                    <label className="check" key={c}>
-                      <input type="checkbox" checked={verifyColumns.includes(c)}
-                        onChange={e=>setVerifyColumns(v=>e.target.checked?[...v,c]:v.filter(x=>x!==c))}/>
-                      {c}
-                    </label>
-                  )}
-                </div>
-                <button className="ghost mt12" onClick={()=>setVerifyColumns(sourceColumns)}>Select all source columns</button>
-              </div>
-            </Step>
-
-            <Step n="04" title="Map columns" sub="Manual mapping or upload your mapping workbook">
-              <div className="card">
-                <div className="mapping-head">
-                  <button className="secondary" onClick={chooseMapping}><Upload size={15}/> Upload Mapping Excel</button>
-                  <button className="ghost" onClick={autoCreateMappings}>Auto-map identical names</button>
-                  {mappingFile && <span className="file-tag">{mappingFile.split(/[\\/]/).pop()}</span>}
-                </div>
-                <div className="mapping-list">
-                  {verifyColumns.map(s=>{
-                    const current = mappings.find(m=>m.source===s)?.destination || "";
-                    return <div className="map-row" key={s}>
-                      <div className="source-name">{s}</div><span className="arrow">→</span>
-                      <Select value={current} placeholder="Destination column" options={destinationColumns}
-                        onChange={v=>setMappings(prev=>{
-                          const exists=prev.some(m=>m.source===s);
-                          return exists ? prev.map(m=>m.source===s?{source:s,destination:v}:m) : [...prev,{source:s,destination:v}]
-                        })}/>
-                    </div>
-                  })}
-                </div>
-              </div>
-            </Step>
-
-            <Step n="05" title="Comparison intelligence" sub="Choose one comparison rule per reconciliation">
-              <div className="mode-grid">
-                <ModeCard active={mode==="general"} icon={<GitCompareArrows/>} title="General Equal"
-                  text="Normalized equality. Values must resolve to the same semantic text."
-                  onClick={()=>setMode("general")}/>
-                <ModeCard active={mode==="kb"} icon={<KeyRound/>} title="KB Doc"
-                  text="Translate source values through organization-specific KB rules before comparing."
-                  onClick={()=>setMode("kb")}/>
-              </div>
-              {mode==="kb" && <div className="kb-panel">
-                <KeyRound size={19}/>
-                <div><b>KB Doc enabled</b><p>Upload a workbook containing Source Column, Source Value, Destination Column and Destination Value.</p></div>
-                <button className="secondary" onClick={chooseKB}>Upload KB Excel</button>
-                {kbRules.length>0 && <span className="rule-count">{kbRules.length} rules</span>}
-              </div>}
-            </Step>
-
-            <div className="action-row">
-              <button className="ghost" onClick={saveCurrent}>Save configuration</button>
-              <button className="primary" disabled={busy} onClick={run}>
-                {busy ? "Reconciling..." : <><GitCompareArrows size={17}/> Run reconciliation</>}
-              </button>
-            </div>
-          </section>
-        )}
-
-        {tab==="results" && <Results result={result} onExport={exportResult}/>}
-
-        {tab==="schedules" && <Schedules configs={configs} onLoad={loadConfig} onDelete={id=>{deleteConfiguration(id);setConfigs(getConfigurations())}}/>}
-
-        {tab==="alerts" && <InfoPage title="Mismatch Alerts" text="The alert service is isolated from the reconciliation engine. In production, configure SMTP/OAuth credentials in the Electron main process and store secrets in the operating-system credential store."/>}
-
-        {tab==="settings" && <InfoPage title="Settings" text="Recommended production settings include report retention, duplicate-key policy, KB fallback policy, alert thresholds, and secure email credentials."/>}
-      </main>
-    </div>
-  );
-}
-
-function pickFile(accept: string): Promise<File | null> {
-  return new Promise(resolve => {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = accept;
-    input.onchange = () => resolve(input.files?.[0] ?? null);
-    input.click();
+  const [page, setPage] = useState<"home" | "workspace">("home");
+  const [source, setSource] = useState<Dataset | null>(null); const [destination, setDestination] = useState<Dataset | null>(null);
+  const [mappings, setMappings] = useState<Mapping[]>([]); const [rules, setRules] = useState<KBRule[]>([]); const [organization, setOrganization] = useState("");
+  const [result, setResult] = useState<ResultRow[]>([]); const [message, setMessage] = useState(""); const [filter, setFilter] = useState(""); const [savedReconciliations, setSavedReconciliations] = useState<SavedReconciliation[]>(getSavedReconciliations); const sourceInput = useRef<HTMLInputElement>(null); const destinationInput = useRef<HTMLInputElement>(null); const mappingInput = useRef<HTMLInputElement>(null); const kbInput = useRef<HTMLInputElement>(null); const columnSwipeMode = useRef<boolean | null>(null); const mappingsInitialized = useRef(false);
+  useEffect(() => { if (source && destination && !mappingsInitialized.current) { setMappings(defaultMappings(source, destination)); mappingsInitialized.current = true; } }, [source, destination]);
+  const usesKB = mappings.some(mapping => mapping.method === "kb");
+  const visible = useMemo(() => { const query = normalized(filter); return result.filter(row => !query || normalized(`${row.key} ${row.status} ${row.fields.map(field => `${field.sourceValue} ${field.destinationValue}`).join(" ")}`).includes(query)); }, [filter, result]);
+  const stats = useMemo(() => ({ matches: result.filter(row => row.status === "MATCH").length, differences: result.filter(row => row.status === "DIFFERENCE").length, missing: result.filter(row => row.status === "MISSING").length, destinationOnly: result.filter(row => row.status === "DESTINATION_ONLY").length }), [result]);
+  const report = useMemo(() => mappings.filter(mapping => mapping.source && mapping.destination).map(mapping => ({ mapping })), [mappings]);
+  const updateDataset = async (file: File | undefined, side: "source" | "destination") => { if (!file) return; try { setMessage(""); const dataset = await readDataset(file); side === "source" ? setSource(dataset) : setDestination(dataset); setResult([]); } catch (error) { setMessage(error instanceof Error ? error.message : "Could not read file."); } };
+  const run = () => { if (!source || !destination) return setMessage("Upload both datasets first."); if (usesKB && !rules.length) return setMessage("Upload a KB mapping workbook for columns using KB Doc."); try { setResult(reconcile(source, destination, mappings, rules, organization)); setMessage(""); } catch (error) { setMessage(error instanceof Error ? error.message : "Reconciliation failed."); } };
+  const newReconciliation = () => { mappingsInitialized.current = false; setSource(null); setDestination(null); setMappings([]); setRules([]); setOrganization(""); setResult([]); setFilter(""); setMessage("Start a new reconciliation by uploading source and destination files."); if (sourceInput.current) sourceInput.current.value = ""; if (destinationInput.current) destinationInput.current.value = ""; };
+  const saveReconciliation = () => { if (!mappings.length) return setMessage("Configure at least one column mapping before saving."); const name = window.prompt("Name this reconciliation", `Reconciliation ${new Date().toLocaleDateString()}`)?.trim(); if (!name) return; const item: SavedReconciliation = { id: id(), name, mappings, rules, organization, savedAt: new Date().toISOString() }; const next = [item, ...savedReconciliations]; saveSavedReconciliations(next); setSavedReconciliations(next); setMessage(`Saved “${name}”. Upload any source and destination files, then run it again.`); };
+  const loadReconciliation = (savedId: string) => { const item = savedReconciliations.find(saved => saved.id === savedId); if (!item) return; mappingsInitialized.current = true; setMappings(item.mappings); setRules(item.rules); setOrganization(item.organization); setResult([]); setMessage(`Loaded “${item.name}”. Upload the same or different files, then run reconciliation.`); };
+  const clearAllLocalData = async () => { if (!window.confirm("Clear all local DRT data? This removes uploaded data in the current session, saved reconciliations, and DRT Cache Storage. This cannot clear browser history, downloads, or operating-system traces.")) return; newReconciliation(); localStorage.removeItem(SAVED_RECONCILIATIONS_KEY); sessionStorage.removeItem(SAVED_RECONCILIATIONS_KEY); if ("caches" in window) await Promise.all((await caches.keys()).map(key => caches.delete(key))); setSavedReconciliations([]); setMessage("All local DRT data and Cache Storage entries were cleared. Browser history and downloaded files must be cleared from your browser manually."); };
+  const update = (mappingId: string, patch: Partial<Mapping>) => setMappings(current => current.map(mapping => mapping.id === mappingId ? { ...mapping, ...patch } : mapping));
+  const toggleColumn = (column: string, selected: boolean) => setMappings(current => {
+    if (!selected) return current.filter(mapping => mapping.source !== column);
+    if (current.some(mapping => mapping.source === column)) return current;
+    return [...current, { id: id(), source: column, destination: destination?.columns.includes(column) ? column : destination?.columns[0] || "", isKey: current.length === 0, method: "general", threshold: 85 }];
   });
+  const isColumnSelected = (column: string) => mappings.some(mapping => mapping.source === column);
+  const startColumnSwipe = (column: string) => { const selected = !isColumnSelected(column); columnSwipeMode.current = selected; toggleColumn(column, selected); };
+  const extendColumnSwipe = (column: string) => { if (columnSwipeMode.current !== null) toggleColumn(column, columnSwipeMode.current); };
+  const selectColumns = (selectAll: boolean) => { if (!source || !destination) return; setMappings(current => selectAll ? source.columns.map((column, index) => current.find(mapping => mapping.source === column) || { id: id(), source: column, destination: destination.columns.includes(column) ? column : destination.columns[0] || "", isKey: index === 0, method: "general" as Method, threshold: 85 }) : []); };
+  const useKBForMappings = () => setMappings(current => current.map(mapping => ({ ...mapping, method: "kb" as Method })));
+  const mapSameNames = () => { if (!destination) return; setMappings(current => current.map(mapping => destination.columns.includes(mapping.source) ? { ...mapping, destination: mapping.source } : mapping)); };
+  const loadColumnMappingDoc = async (file: File | undefined) => { if (!file || !source || !destination) return; try { const pairs = (await readColumnMappings(file)).filter(pair => source.columns.includes(pair.source) && destination.columns.includes(pair.destination)); if (!pairs.length) throw new Error("No mappings in the document match the uploaded source and destination columns."); setMappings(current => pairs.map((pair, index) => { const existing = current.find(mapping => mapping.source === pair.source); return existing ? { ...existing, destination: pair.destination } : { id: id(), source: pair.source, destination: pair.destination, isKey: index === 0, method: "general" as Method, threshold: 85 }; })); setResult([]); setMessage(`${pairs.length} column mappings loaded.`); } catch (error) { setMessage(error instanceof Error ? error.message : "Could not read the column mapping document."); } };
+  const exportCSV = () => { const data = result.map(row => Object.assign({}, ...report.map(item => { const field = row.fields.find(value => value.source === item.mapping.source && value.destination === item.mapping.destination); const pair = `${item.mapping.source} vs ${item.mapping.destination}`; return { [`${item.mapping.source} (Source)`]: field?.sourceValue || "", [`${item.mapping.destination} (Destination)`]: field?.destinationValue || "", [`Comparison Result (${pair})`]: field?.status === "MATCH" ? "Matching" : "Not Matching" }; }))); const csv = Papa.unparse(data); const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" })); const link = document.createElement("a"); link.href = url; link.download = "drt-reconciliation.csv"; link.click(); URL.revokeObjectURL(url); };
+  if (page === "home") return <HomePage onOpenWorkspace={() => setPage("workspace")}/>;
+  return <><style>{styles}</style><main className="shell"><header style={{display:"flex",alignItems:"center",justifyContent:"flex-start",gap:30,flexWrap:"wrap"}}><button className="brand" onClick={() => setPage("home")} style={{alignSelf:"flex-start",justifyContent:"flex-start",textAlign:"left",border:0,background:"transparent",color:"inherit",cursor:"pointer",padding:0,margin:0}} title="Back to DRT home"><div className="brand-mark"><GitCompareArrows size={21}/></div><span>DRT <small>Data Reconciliation</small></span></button><div className="header-copy" style={{flex:"1 1 520px"}}><p className="eyebrow">LOCAL · PRIVATE · FAST</p><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:18,flexWrap:"wrap"}}><h1>Reconcile data with confidence.</h1><button className="run" onClick={newReconciliation}><GitCompareArrows size={16}/> New reconciliation</button></div><p>CSV and Excel stay in your browser. Match each column with its own rule.</p></div></header>
+  {message && <div className="notice">{message}</div>}
+  <section className="upload-grid"><FileCard title="Source dataset" dataset={source} onClick={() => sourceInput.current?.click()}/><FileCard title="Destination dataset" dataset={destination} onClick={() => destinationInput.current?.click()}/><input ref={sourceInput} hidden type="file" accept=".csv,.xlsx,.xls" onChange={event => updateDataset(event.target.files?.[0], "source")}/><input ref={destinationInput} hidden type="file" accept=".csv,.xlsx,.xls" onChange={event => updateDataset(event.target.files?.[0], "destination")}/></section>{savedReconciliations.length > 0 && <section style={{marginTop:16,padding:15,border:"1px solid #2f3d56",borderRadius:12,background:"#101620",display:"flex",alignItems:"center",gap:12}}><div style={{flex:1}}><b style={{fontSize:13}}>Saved reconciliations</b><span style={{display:"block",fontSize:11,color:"#9aa6bc",marginTop:3}}>Load a saved mapping and use it with these files or upload different files.</span></div><select style={{minWidth:240,background:"#0b1019",border:"1px solid #28364e",borderRadius:8,color:"#e6eeff",padding:"9px 10px"}} defaultValue="" onChange={event => { if (event.target.value) loadReconciliation(event.target.value); event.currentTarget.value = ""; }}><option value="">Load saved reconciliation…</option>{savedReconciliations.map(saved => <option key={saved.id} value={saved.id}>{saved.name}</option>)}</select></section>}
+  {source && destination && <section className="column-picker" onPointerUp={() => { columnSwipeMode.current = null; }} onPointerLeave={() => { columnSwipeMode.current = null; }} style={{marginTop:16,padding:18,border:"1px solid #3b4b6c",borderRadius:14,background:"#121a28"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"start",gap:12,marginBottom:13}}><div><b style={{display:"block",fontSize:14}}>Source columns to reconcile</b><span style={{display:"block",marginTop:5,fontSize:12,color:"#9aa6bc"}}>Drag across column chips to select or deselect many fields at once.</span></div><div style={{display:"flex",gap:7}}><button type="button" className="secondary" onClick={() => selectColumns(true)}>Select all</button><button type="button" className="secondary" onClick={() => selectColumns(false)}>Clear</button></div></div><div style={{display:"flex",flexWrap:"wrap",gap:8}}>{source.columns.map(column => <button type="button" key={column} onPointerDown={() => startColumnSwipe(column)} onPointerEnter={() => extendColumnSwipe(column)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleColumn(column, !isColumnSelected(column)); } }} style={{display:"flex",alignItems:"center",gap:7,padding:"8px 10px",border:`1px solid ${isColumnSelected(column) ? "#718cff" : "#2f3d56"}`,borderRadius:8,fontSize:12,cursor:"pointer",color:"#e6eeff",background:isColumnSelected(column) ? "#263a68" : "#0d131e"}}>{isColumnSelected(column) && <Check size={14}/>} {column}</button>)}</div></section>}
+  {source && destination && <section className="panel"><div className="panel-title"><div><p className="eyebrow">COLUMN RULES</p><h2>Map, key, and compare</h2><p>Choose General Equal, token-set Fuzzy Match, or KB Doc independently for every column.</p></div><div style={{display:"flex",flexWrap:"wrap",justifyContent:"flex-end",gap:8}}><button className="secondary" onClick={() => mappingInput.current?.click()}><FileUp size={15}/> Upload mapping doc</button><button className="secondary" onClick={useKBForMappings}><FileUp size={15}/> Use KB Doc</button><button className="secondary" onClick={mapSameNames}><SlidersHorizontal size={15}/> Map same names</button><button className="secondary" onClick={() => setMappings(current => [...current, { id: id(), source: source.columns[0], destination: destination.columns[0], isKey: false, method: "general", threshold: 85 }])}><Plus size={15}/> Add column</button><input ref={mappingInput} hidden type="file" accept=".csv,.xlsx,.xls" onChange={event => loadColumnMappingDoc(event.target.files?.[0])}/></div></div>
+  <div className="mapping-table"><div className="mapping-head"><span>Source column</span><span>Destination column</span><span>Method</span><span>Threshold</span><span>Key</span><span/></div>{mappings.map(mapping => <div className="mapping-row" key={mapping.id}><Select options={source.columns} value={mapping.source} onChange={value => update(mapping.id, { source: value })}/><Select options={destination.columns} value={mapping.destination} onChange={value => update(mapping.id, { destination: value })}/><select value={mapping.method} onChange={event => update(mapping.id, { method: event.target.value as Method })}><option value="general">General Equal</option><option value="fuzzy">Fuzzy Match</option><option value="kb">KB Doc</option></select>{mapping.method === "fuzzy" ? <div className="threshold"><input aria-label="Fuzzy threshold" type="range" min="50" max="100" value={mapping.threshold} onChange={event => update(mapping.id, { threshold: Number(event.target.value) })}/><b>{mapping.threshold}%</b></div> : <span className="muted">—</span>}<button className={`key ${mapping.isKey ? "active" : ""}`} onClick={() => update(mapping.id, { isKey: !mapping.isKey })}>{mapping.isKey ? "Key" : "Set key"}</button><button className="delete" aria-label="Remove mapping" onClick={() => setMappings(current => current.filter(item => item.id !== mapping.id))}><Trash2 size={16}/></button></div>)}</div>
+  {usesKB && <div className="kb"><div><b>KB value mapping</b><p>Upload an XLSX sheet with Source Column, Source Value, Destination Column, Destination Value, and optional Organization.</p></div><input value={organization} onChange={event => setOrganization(event.target.value)} placeholder="Organization (optional)"/><button className="secondary" onClick={() => kbInput.current?.click()}><FileUp size={15}/>{rules.length ? `${rules.length} rules loaded` : "Upload KB Excel"}</button><input ref={kbInput} hidden type="file" accept=".xlsx,.xls" onChange={async event => { try { setRules(await readKB(event.target.files?.[0] as File)); setMessage(""); } catch (error) { setMessage(error instanceof Error ? error.message : "Could not read KB workbook."); } }}/></div>}</section>}
+  {source && destination && <div style={{display:"flex",justifyContent:"flex-end",gap:10,margin:"22px 0 8px",flexWrap:"wrap"}}><button className="secondary" onClick={clearAllLocalData}><Trash2 size={15}/> Clear all local data</button><button className="secondary" onClick={saveReconciliation}><FileDown size={15}/> Save reconciliation</button><button className="run" onClick={run}><Sparkles size={16}/> Run reconciliation</button></div>}
+  {!!result.length && <section className="results"><div className="result-head"><div><p className="eyebrow">RECONCILIATION RESULT</p><h2>{source?.data.length.toLocaleString()} source rows evaluated</h2><p className="result-subtitle">UQAT-style run summary · {mappings.filter(mapping => mapping.isKey).length} mapped key{mappings.filter(mapping => mapping.isKey).length === 1 ? "" : "s"}</p></div><button className="secondary" onClick={exportCSV}><FileDown size={15}/> Export CSV</button></div><div className="stats"><Stat label="Match rate" value={`${source?.data.length ? Math.round((stats.matches / source.data.length) * 1000) / 10 : 0}%`}/><Stat label="Total rows" value={source?.data.length || 0}/><Stat label="Fully matched" value={stats.matches}/><Stat label="Rows with diffs" value={stats.differences}/><Stat label="Rows with missing" value={stats.missing}/><Stat label="Dest-only rows" value={stats.destinationOnly}/></div><div className="table-panel"><div className="table-tools"><b>Comparison report · showing {Math.min(visible.length, 500)} of {result.length}</b><input value={filter} onChange={event => setFilter(event.target.value)} placeholder="Search key, value, status…"/></div><div className="table-wrap"><table><thead><tr>{report.map(item => <React.Fragment key={item.mapping.id}><th>{item.mapping.source} (Source)</th><th>{item.mapping.destination} (Destination)</th><th>Comparison Result ({item.mapping.source} vs {item.mapping.destination})</th></React.Fragment>)}</tr></thead><tbody>{visible.slice(0, 500).map((row, rowIndex) => <tr key={rowIndex}>{report.map(item => { const field = row.fields.find(value => value.source === item.mapping.source && value.destination === item.mapping.destination); return <React.Fragment key={item.mapping.id}><td>{field?.sourceValue || ""}</td><td>{field?.destinationValue || ""}</td><td><span className={`badge ${field?.status === "MATCH" ? "match" : "difference"}`}>{field?.status === "MATCH" ? "Matching" : "Not Matching"}</span></td></React.Fragment>; })}</tr>)}</tbody></table></div></div></section>}</main></>;
 }
 
-function Nav({active,icon,text,onClick}:{active:boolean;icon:React.ReactNode;text:string;onClick:()=>void}) {
-  return <button className={`nav ${active?"active":""}`} onClick={onClick}>{icon}<span>{text}</span></button>
+function Select({ options, value, onChange }: { options: string[]; value: string; onChange: (value: string) => void }) { return <div className="select"><select value={value} onChange={event => onChange(event.target.value)}>{options.map(option => <option key={option}>{option}</option>)}</select><ChevronDown size={14}/></div>; }
+function FileCard({ title, dataset, onClick }: { title: string; dataset: Dataset | null; onClick: () => void }) { return <button className="file-card" onClick={onClick}><div className="file-icon"><Upload size={19}/></div><div><b>{title}</b><p>{dataset ? `${dataset.name} · ${dataset.data.length.toLocaleString()} rows · ${dataset.columns.length} columns` : "Upload CSV, XLSX, or XLS"}</p></div><span>{dataset ? "Replace" : "Browse"}</span></button>; }
+function Stat({ label, value }: { label: string; value: number | string }) { return <div className="stat"><CheckCircle2 size={17}/><div><b>{value.toLocaleString()}</b><span>{label}</span></div></div>; }
+
+function HomePage({ onOpenWorkspace }: { onOpenWorkspace: () => void }) {
+  return <><style>{homeStyles}</style><main className="home-shell"><nav className="home-nav"><button className="home-brand" onClick={onOpenWorkspace}><span><GitCompareArrows size={19}/></span><b>DRT</b><small>Data Reconciliation Tool</small></button><button className="home-link" onClick={onOpenWorkspace}>Open workspace <ArrowRight size={15}/></button></nav><section className="home-hero"><div className="hero-copy"><p className="home-overline">[ Data quality, made observable ]</p><h1>Every record.<br/><em>Accounted for.</em></h1><p className="hero-description">A modern reconciliation workspace for teams that need dependable proof between source and destination data.</p><div className="hero-actions"><button className="home-cta" onClick={onOpenWorkspace}>Start reconciling <ArrowRight size={16}/></button><span>Runs privately in your browser</span></div><div className="hero-signals"><span><Check size={14}/> CSV & Excel</span><span><Check size={14}/> Mapping docs</span><span><Check size={14}/> Evidence-ready reports</span></div></div><div className="hero-visual"><img src="https://images.unsplash.com/photo-1551288049-bebda4e38f71?auto=format&fit=crop&w=1600&q=85" alt="Data analytics workspace"/><div className="visual-shade"/><div className="visual-card"><p>RECONCILIATION STATUS</p><strong>99.8%</strong><span>records reconciled</span><div><i/><i/><i/><i/><i/></div></div></div></section><section id="about-tool" className="home-details"><p className="home-overline">[ About DRT · how to use it ]</p><h2>Three steps from source files to trusted evidence.</h2><div className="detail-grid"><Detail icon={<FileSpreadsheet size={20}/>} title="1. Upload and select" text="Upload CSV or Excel source and destination files, then select the source columns that need reconciliation."/><Detail icon={<SlidersHorizontal size={20}/>} title="2. Map and match" text="Use a column-mapping document or same-name mapping, choose keys, then set exact, fuzzy, or KB value matching per field."/><Detail icon={<ShieldCheck size={20}/>} title="3. Run and export" text="Run the comparison, review the evidence-ready report, then export CSV or save the configuration for a later rerun."/></div></section><footer className="home-footer"><span>DRT / DATA RECONCILIATION TOOL</span><button onClick={onOpenWorkspace}>Enter workspace <ArrowRight size={14}/></button></footer></main></>;
 }
-function Step({n,title,sub,children}:{n:string;title:string;sub:string;children:React.ReactNode}) {
-  return <><div className="step"><span>{n}</span><div><h2>{title}</h2><p>{sub}</p></div></div>{children}</>
-}
-function Select({value,placeholder,options,onChange}:{value:string;placeholder:string;options:string[];onChange:(v:string)=>void}) {
-  return <div className="select-wrap"><select value={value} onChange={e=>onChange(e.target.value)}><option value="">{placeholder}</option>{options.map(o=><option key={o} value={o}>{o}</option>)}</select><ChevronDown size={14}/></div>
-}
-function ModeCard({active,icon,title,text,onClick}:{active:boolean;icon:React.ReactNode;title:string;text:string;onClick:()=>void}) {
-  return <button className={`mode-card ${active?"selected":""}`} onClick={onClick}><div className="mode-icon">{icon}</div><div><h3>{title}</h3><p>{text}</p></div>{active&&<Check className="selected-icon" size={17}/>}</button>
-}
-function Schedules({configs,onLoad,onDelete}:{configs:SavedConfiguration[];onLoad:(c:SavedConfiguration)=>void;onDelete:(id:string)=>void}) {
-  return <section className="results"><div className="eyebrow">LOCAL CONFIGURATIONS</div><h2>Saved reconciliation jobs</h2><p className="section-copy">Configurations are stored locally in this desktop application. OS-level scheduling can invoke the packaged application for unattended runs.</p>
-    <div className="card config-list">{configs.length===0?<div className="empty">No saved configurations.</div>:configs.map(c=><div className="config" key={c.id}><div><b>{c.name}</b><span>{c.mode==="kb"?"KB Doc":"General Equal"} • {c.mappings.length} mappings</span></div><div><button className="ghost" onClick={()=>onLoad(c)}>Load</button><button className="icon-btn" onClick={()=>onDelete(c.id)}><Trash2 size={16}/></button></div></div>)}</div>
-  </section>
-}
-function InfoPage({title,text}:{title:string;text:string}) {
-  return <section className="results"><div className="eyebrow">DRT MODULE</div><h2>{title}</h2><div className="card info"><p>{text}</p></div></section>
-}
+
+function Detail({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) { return <article className="detail-card"><div>{icon}</div><h3>{title}</h3><p>{text}</p></article>; }
+
+const homeStyles = `:root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:#07090d}*{box-sizing:border-box}body{margin:0;background:#07090d}.home-shell{min-height:100vh;color:#f6f7fb;background:#07090d;padding:0 5vw;overflow:hidden}.home-shell button{font:inherit}.home-nav{height:82px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff18}.home-brand{display:flex;align-items:center;gap:9px;border:0;background:transparent;color:#fff;cursor:pointer;padding:0}.home-brand span{display:grid;place-items:center;width:34px;height:34px;background:#e7ecff;color:#101522;border-radius:9px}.home-brand b{font-size:17px;letter-spacing:-.04em}.home-brand small{font-size:10px;color:#8c93a1;letter-spacing:.1em;text-transform:uppercase;margin-left:3px}.home-link,.home-footer button{border:0;background:transparent;color:#e6eaff;display:inline-flex;gap:7px;align-items:center;font-size:12px;cursor:pointer}.home-hero{min-height:calc(100vh - 82px);display:grid;grid-template-columns:minmax(0,1.05fr) minmax(330px,.95fr);align-items:center;gap:7vw;padding:8vh 0}.home-overline{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#8fa3ff;font-weight:800}.hero-copy h1{font-size:clamp(3.4rem,7vw,7rem);letter-spacing:-.08em;line-height:.9;margin:23px 0}.hero-copy h1 em{font-style:normal;color:#aab7e9}.hero-description{max-width:520px;font-size:18px;line-height:1.6;color:#a6adba}.hero-actions{display:flex;align-items:center;gap:20px;margin-top:32px}.home-cta{display:inline-flex;align-items:center;gap:9px;border:0;background:#f3f5fb;color:#111522;padding:14px 18px;border-radius:8px;font-weight:750;cursor:pointer}.hero-actions span{font-size:11px;color:#9098a8}.hero-signals{display:flex;gap:16px;flex-wrap:wrap;margin-top:42px;color:#c4cad5;font-size:11px}.hero-signals span{display:flex;align-items:center;gap:5px}.hero-signals svg{color:#91a5ff}.hero-visual{position:relative;height:min(580px,68vh);border-radius:18px;overflow:hidden;border:1px solid #ffffff1f;background:#141923}.hero-visual img{width:100%;height:100%;object-fit:cover;opacity:.5;filter:saturate(.7) contrast(1.1)}.visual-shade{position:absolute;inset:0;background:linear-gradient(145deg,#10152c44,#07090dcc 75%)}.visual-card{position:absolute;left:26px;right:26px;bottom:26px;padding:20px;background:#0c101be8;border:1px solid #ffffff26;border-radius:12px;backdrop-filter:blur(14px)}.visual-card p{font-size:9px;letter-spacing:.15em;color:#9eaabd;margin:0}.visual-card strong{display:block;font-size:42px;letter-spacing:-.06em;margin-top:7px}.visual-card span{font-size:11px;color:#aab2c0}.visual-card div{display:flex;gap:5px;margin-top:16px}.visual-card i{display:block;flex:1;height:4px;background:#5c73e9;border-radius:999px}.visual-card i:last-child{background:#d2d9f1}.home-details{padding:100px 0;border-top:1px solid #ffffff18}.home-details h2{max-width:700px;margin:17px 0 42px;font-size:clamp(2rem,4vw,3.8rem);letter-spacing:-.06em;line-height:1}.detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.detail-card{border:1px solid #ffffff18;border-radius:12px;padding:23px;background:#0d1017}.detail-card>div{color:#a9b9ff}.detail-card h3{margin:28px 0 8px;font-size:16px;letter-spacing:-.03em}.detail-card p{margin:0;color:#99a2b0;font-size:13px;line-height:1.6}.home-footer{display:flex;justify-content:space-between;border-top:1px solid #ffffff18;padding:24px 0;color:#747d8d;font-size:10px;letter-spacing:.12em}@media(max-width:820px){.home-shell{padding:0 24px}.home-hero{grid-template-columns:1fr;padding:8vh 0}.hero-visual{height:380px}.detail-grid{grid-template-columns:1fr}.home-brand small{display:none}}@media(max-width:480px){.home-nav{height:70px}.home-hero{padding:50px 0}.hero-actions{align-items:flex-start;flex-direction:column}.hero-visual{height:300px}.home-footer{gap:16px;align-items:center}}`;
+
+const styles = `:root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#ecf2ff;background:#080b12}*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 85% -5%,#1e3061 0%,transparent 60%),#080b12}.shell{max-width:1480px;margin:auto;padding:28px 5vw 70px}header{display:grid;grid-template-columns:220px 1fr auto;align-items:center;gap:30px;margin-bottom:44px}.brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.03em}.brand small{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;font-weight:600;color:#8793ac;margin-top:2px}.brand-mark{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#6d8cff,#9a66ff);box-shadow:0 10px 30px #5e75ff42}.header-copy h1,.panel h2,.results h2{margin:0;font-size:28px;letter-spacing:-.045em}.header-copy>p,.panel-title p{color:#9aa6bc;font-size:13px;margin:6px 0 0}.eyebrow{font-size:10px!important;font-weight:800;letter-spacing:.14em;color:#8196ff!important;margin:0 0 8px!important}.run,.secondary{border:0;border-radius:10px;padding:11px 14px;display:inline-flex;align-items:center;gap:8px;font-weight:750;cursor:pointer}.run{background:#eaf0ff;color:#111827}.secondary{background:#161d2c;color:#dbe5fb;border:1px solid #2b3850}.notice{border:1px solid #754d34;background:#291c17;color:#ffc69a;padding:12px 14px;border-radius:10px;font-size:13px;margin-bottom:16px}.upload-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.file-card{border:1px solid #26324a;background:linear-gradient(145deg,#141b29,#101620);border-radius:15px;padding:20px;text-align:left;color:#edf3ff;display:flex;align-items:center;gap:13px;cursor:pointer;transition:.2s}.file-card:hover{border-color:#718cff;transform:translateY(-2px)}.file-card>span{margin-left:auto;font-size:11px;color:#9cb0ff}.file-icon{width:39px;height:39px;display:grid;place-items:center;border-radius:11px;color:#a9b8ff;background:#1f2a43}.file-card b{font-size:14px}.file-card p{font-size:11px;color:#8e9ab0;margin:5px 0 0}.panel,.results{margin-top:20px;border:1px solid #243047;background:#101620;border-radius:16px;padding:23px}.panel-title,.result-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}.mapping-table{margin-top:21px}.mapping-head,.mapping-row{display:grid;grid-template-columns:1.2fr 1.2fr 1fr 1fr 66px 34px;gap:10px;align-items:center}.mapping-head{padding:0 3px 8px;color:#8490a7;font-size:10px;text-transform:uppercase;letter-spacing:.08em}.mapping-row{padding:9px 0;border-top:1px solid #202a3c}.mapping-row select,.kb input,.table-tools input{width:100%;background:#0b1019;border:1px solid #28364e;color:#e6eeff;border-radius:8px;padding:9px 10px;outline:none;font-size:12px}.select{position:relative}.select svg{position:absolute;right:9px;top:50%;transform:translateY(-50%);pointer-events:none;color:#8d9bb6}.select select{appearance:none}.threshold{display:flex;align-items:center;gap:7px}.threshold input{accent-color:#91a4ff;width:100%}.threshold b{font-size:11px;color:#b6c2ff;min-width:31px}.muted{color:#607089;text-align:center}.key{font-size:10px;border:1px solid #35445f;background:#151c2a;color:#aebbd3;border-radius:7px;padding:8px 3px;cursor:pointer}.key.active{background:#26345c;border-color:#7892ff;color:#e9efff}.delete{background:transparent;border:0;color:#8390a7;cursor:pointer;padding:7px}.delete:hover{color:#ff9a9a}.kb{margin-top:17px;padding:14px;border:1px solid #3b3761;background:#151526;border-radius:11px;display:flex;align-items:center;gap:13px}.kb div{flex:1}.kb b{font-size:13px}.kb p{font-size:11px;color:#9da8be;margin:4px 0 0}.kb input{width:190px}.results{background:#0e141e}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:11px;margin:20px 0}.stat{padding:14px;background:#141c2a;border:1px solid #26324a;border-radius:10px;display:flex;gap:9px;color:#91a6ff}.stat b{display:block;color:#f0f5ff;font-size:19px}.stat span{font-size:10px;color:#8b97ad}.table-panel{border:1px solid #26324a;border-radius:11px;overflow:hidden}.table-tools{padding:12px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #26324a;font-size:12px}.table-tools input{width:220px}.table-wrap{overflow:auto;max-height:520px}table{border-collapse:collapse;width:100%;font-size:11px}th{text-align:left;position:sticky;top:0;background:#141c2a;color:#8d9bb1;font-size:9px;letter-spacing:.08em;text-transform:uppercase}th,td{padding:11px;border-bottom:1px solid #202a3a;white-space:nowrap}td{color:#d8e1f2}.badge{font-size:9px;font-weight:800;letter-spacing:.05em;padding:4px 6px;border-radius:5px;background:#1d2f26;color:#8ee3b0}.badge.difference{background:#382225;color:#ffabab}.badge.missing,.badge.destination_only{background:#392f1d;color:#ffd683}@media(max-width:900px){header{grid-template-columns:1fr}.run{width:max-content}.mapping-head{display:none}.mapping-row{grid-template-columns:1fr 1fr}.mapping-row>*:nth-child(5),.mapping-row>*:nth-child(6){justify-self:start}.kb{align-items:stretch;flex-direction:column}.kb input{width:100%}.stats{grid-template-columns:1fr 1fr}}@media(max-width:560px){.shell{padding:20px 14px}.upload-grid,.stats,.mapping-row{grid-template-columns:1fr}.panel,.results{padding:16px}.panel-title,.result-head{flex-direction:column}.file-card{padding:15px}}`;
+
 createRoot(document.getElementById("root")!).render(<App/>);
